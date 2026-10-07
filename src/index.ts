@@ -7,6 +7,7 @@ interface Env {
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET: string;
   AUTH_START_KEY: string;
+  TOKEN_ENCRYPTION_KEY: string;
   GMAIL_PUBSUB_TOPIC?: string;
   GMAIL_PUSH_KEY?: string;
   OPENAI_API_KEY: string;
@@ -31,6 +32,67 @@ const escapeHtml = (value: string) => value.replace(/[&<>"']/g, c => ({ "&": "&a
 const b64url = (input: string) => btoa(unescape(encodeURIComponent(input))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 const header = (message: GmailMessage, name: string) => message.payload?.headers?.find(h => h.name.toLowerCase() === name.toLowerCase())?.value ?? "";
 
+type EncryptedGmailToken = { version: 1; iv: string; ciphertext: string };
+
+function encodeBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function decodeBase64Url(value: string): Uint8Array {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(normalized + "=".repeat((4 - normalized.length % 4) % 4));
+  return Uint8Array.from(binary, character => character.charCodeAt(0));
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
+}
+
+async function tokenEncryptionKey(env: Env): Promise<CryptoKey> {
+  if (!/^[\da-f]{64}$/i.test(env.TOKEN_ENCRYPTION_KEY)) throw new Error("TOKEN_ENCRYPTION_KEY debe ser una clave hexadecimal de 64 caracteres");
+  const rawKey = new ArrayBuffer(32);
+  const bytes = new Uint8Array(rawKey);
+  env.TOKEN_ENCRYPTION_KEY.match(/.{2}/g)!.forEach((pair, index) => { bytes[index] = Number.parseInt(pair, 16); });
+  return crypto.subtle.importKey("raw", rawKey, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+function isGmailToken(value: unknown): value is GmailToken {
+  return typeof value === "object" && value !== null && "access_token" in value && typeof value.access_token === "string" && "expires_at" in value && typeof value.expires_at === "number";
+}
+
+function isEncryptedGmailToken(value: unknown): value is EncryptedGmailToken {
+  return typeof value === "object" && value !== null && "version" in value && value.version === 1 && "iv" in value && typeof value.iv === "string" && "ciphertext" in value && typeof value.ciphertext === "string";
+}
+
+async function storeGmailToken(key: string, token: GmailToken, env: Env): Promise<void> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(token));
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await tokenEncryptionKey(env), plaintext);
+  const value: EncryptedGmailToken = { version: 1, iv: encodeBase64Url(iv), ciphertext: encodeBase64Url(new Uint8Array(ciphertext)) };
+  await env.STORE.put(key, JSON.stringify(value));
+}
+
+async function readGmailToken(key: string, env: Env): Promise<GmailToken | undefined> {
+  const stored = await env.STORE.get(key);
+  if (!stored) return undefined;
+  let value: unknown;
+  try { value = JSON.parse(stored); } catch { throw new Error("El token de Gmail almacenado no es válido"); }
+  if (isEncryptedGmailToken(value)) {
+    const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: toArrayBuffer(decodeBase64Url(value.iv)) }, await tokenEncryptionKey(env), toArrayBuffer(decodeBase64Url(value.ciphertext)));
+    const token: unknown = JSON.parse(new TextDecoder().decode(plaintext));
+    if (!isGmailToken(token)) throw new Error("El token de Gmail descifrado no es válido");
+    return token;
+  }
+  if (!isGmailToken(value)) throw new Error("El token de Gmail almacenado no es válido");
+  // Migrate existing plaintext token records the first time an account is used.
+  await storeGmailToken(key, value, env);
+  return value;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -52,7 +114,7 @@ export default {
 
 const pageStyle = "body{margin:0;background:#f5f7fb;color:#172033;font:16px/1.65 system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:760px;margin:0 auto;padding:48px 24px}h1{line-height:1.2;color:#142b52}h2{margin-top:32px;color:#142b52}a{color:#155eef}header{border-bottom:1px solid #d9e0ec;background:white}header div{max-width:760px;margin:auto;padding:18px 24px;font-weight:650}footer{margin-top:48px;padding-top:18px;border-top:1px solid #d9e0ec;color:#53627a;font-size:14px}li{margin:8px 0}";
 const homepage = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Asistente de correo en Telegram</title><style>${pageStyle}</style></head><body><header><div>Asistente de correo en Telegram</div></header><main><h1>Tu correo, desde tu chat privado de Telegram</h1><p>Este bot personal permite consultar y buscar mensajes de Gmail, leer correos y, cuando el usuario lo solicita, redactar, responder o programar mensajes. El bot está configurado para atender únicamente al chat de Telegram autorizado por su propietario.</p><h2>Cómo funciona</h2><p>El usuario conecta su cuenta de Google mediante OAuth. El bot consulta Gmail para realizar las acciones solicitadas y envía los resultados a la conversación privada autorizada. Algunas tareas programadas pueden procesarse periódicamente.</p><p>El bot no vende datos ni los utiliza para publicidad. Consulta la <a href="/privacy">Política de privacidad</a> para conocer qué datos se procesan, dónde se almacenan y cómo desconectar la cuenta.</p><footer>Aplicación personal. <a href="/privacy">Política de privacidad</a></footer></main></body></html>`;
-const privacyPolicy = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Política de privacidad | Asistente de correo en Telegram</title><style>${pageStyle}</style></head><body><header><div><a href="/">Asistente de correo en Telegram</a></div></header><main><h1>Política de privacidad</h1><p><strong>Última actualización: 7 de octubre de 2026</strong></p><p>Esta aplicación es un bot personal de Telegram que permite a su propietario gestionar una cuenta de Gmail desde un chat privado. Esta política explica cómo se procesan los datos para prestar esas funciones.</p><h2>Datos que procesa el bot</h2><ul><li>Datos de autorización de Google y tokens OAuth necesarios para conectar Gmail.</li><li>Mensajes y metadatos de Gmail que el usuario solicita consultar, buscar, resumir o modificar.</li><li>El identificador del chat autorizado de Telegram, comandos y preferencias del bot.</li><li>El contenido de correos que el usuario decide redactar, responder o programar.</li></ul><h2>Cómo se usan y comparten</h2><p>Los datos de Gmail se usan para ejecutar las acciones solicitadas por el usuario y se devuelven al chat privado autorizado de Telegram. Google procesa las solicitudes de acceso a Gmail; Cloudflare aloja el Worker y almacena datos operativos en Cloudflare KV; Telegram transporta los comandos y respuestas.</p><p>Si el propietario habilita las funciones de inteligencia artificial, el contenido del correo seleccionado puede enviarse a OpenAI para generar un resumen, evaluar urgencia o proponer una respuesta. Si habilita la transcripción por voz, el audio enviado al bot puede enviarse a OpenAI para transcribirlo. Estas funciones no son necesarias para el uso básico del bot.</p><p>Los datos de Google no se venden, no se usan para publicidad y no se comparten con terceros salvo con los servicios anteriores cuando son necesarios para una función solicitada por el usuario.</p><h2>Almacenamiento y conservación</h2><p>Los tokens de acceso y renovación de Google, junto con las preferencias y tareas programadas necesarias para operar el bot, se almacenan en Cloudflare KV. El bot conserva esos datos mientras la cuenta esté conectada o mientras una tarea siga pendiente. El contenido de Gmail se consulta desde Google cuando se solicita y puede aparecer en las respuestas enviadas a Telegram.</p><h2>Control y eliminación</h2><p>El usuario puede usar <code>/disconnect</code> en Telegram para quitar del bot el token de la cuenta activa y detener su acceso local a Gmail. Para revocar completamente el permiso OAuth, también puede quitar el acceso de la aplicación desde la configuración de seguridad de su cuenta de Google. Las tareas programadas y preferencias del bot pueden requerir eliminación separada.</p><h2>Seguridad y contacto</h2><p>El bot restringe sus comandos al identificador de chat configurado por el propietario y utiliza servicios de infraestructura de Cloudflare, Google y Telegram. Ningún sistema conectado a Internet puede garantizar seguridad absoluta. Para consultas de privacidad, contacta al propietario del bot mediante su chat privado de Telegram.</p><footer><a href="/">Volver a la página principal</a></footer></main></body></html>`;
+const privacyPolicy = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Política de privacidad | Asistente de correo en Telegram</title><style>${pageStyle}</style></head><body><header><div><a href="/">Asistente de correo en Telegram</a></div></header><main><h1>Política de privacidad</h1><p><strong>Última actualización: 7 de octubre de 2026</strong></p><p>Esta aplicación es un bot personal de Telegram que permite a su propietario gestionar una cuenta de Gmail desde un chat privado. Esta política explica cómo se procesan los datos para prestar esas funciones.</p><h2>Datos que procesa el bot</h2><ul><li>Datos de autorización de Google y tokens OAuth necesarios para conectar Gmail.</li><li>Mensajes y metadatos de Gmail que el usuario solicita consultar, buscar, resumir o modificar.</li><li>El identificador del chat autorizado de Telegram, comandos y preferencias del bot.</li><li>El contenido de correos que el usuario decide redactar, responder o programar.</li></ul><h2>Cómo se usan y comparten</h2><p>Los datos de Gmail se usan para ejecutar las acciones solicitadas por el usuario y se devuelven al chat privado autorizado de Telegram. Google procesa las solicitudes de acceso a Gmail; Cloudflare aloja el Worker y almacena datos operativos en Cloudflare KV; Telegram transporta los comandos y respuestas.</p><p>Si el propietario habilita las funciones de inteligencia artificial, el contenido del correo seleccionado puede enviarse a OpenAI para generar un resumen, evaluar urgencia o proponer una respuesta. Si habilita la transcripción por voz, el audio enviado al bot puede enviarse a OpenAI para transcribirlo. Estas funciones no son necesarias para el uso básico del bot.</p><p>Los datos de Google no se venden, no se usan para publicidad y no se comparten con terceros salvo con los servicios anteriores cuando son necesarios para una función solicitada por el usuario.</p><h2>Almacenamiento y conservación</h2><p>Los tokens OAuth de Gmail se cifran con AES-GCM antes de almacenarse en Cloudflare KV. La clave de cifrado se guarda como secreto de Cloudflare y no en el repositorio. Las preferencias y tareas programadas necesarias para operar el bot también se almacenan en Cloudflare KV. El bot conserva esos datos mientras la cuenta esté conectada o mientras una tarea siga pendiente. El contenido de Gmail se consulta desde Google cuando se solicita y puede aparecer en las respuestas enviadas a Telegram.</p><h2>Control y eliminación</h2><p>El usuario puede usar <code>/disconnect</code> en Telegram para quitar del bot el token de la cuenta activa y detener su acceso local a Gmail. Para revocar completamente el permiso OAuth, también puede quitar el acceso de la aplicación desde la configuración de seguridad de su cuenta de Google. Las tareas programadas y preferencias del bot pueden requerir eliminación separada.</p><h2>Seguridad y contacto</h2><p>El bot restringe sus comandos al identificador de chat configurado por el propietario y utiliza servicios de infraestructura de Cloudflare, Google y Telegram. Ningún sistema conectado a Internet puede garantizar seguridad absoluta. Para consultas de privacidad, contacta al propietario del bot mediante su chat privado de Telegram.</p><footer><a href="/">Volver a la página principal</a></footer></main></body></html>`;
 
 async function startGoogleAuth(url: URL, env: Env): Promise<Response> {
   if (url.searchParams.get("key") !== env.AUTH_START_KEY) return new Response("No autorizado", { status: 403 });
@@ -72,11 +134,13 @@ async function finishGoogleAuth(url: URL, env: Env): Promise<Response> {
   const result = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body });
   if (!result.ok) return new Response("Google rechazó la autorización. Revisa las credenciales y la URL de retorno.", { status: 400 });
   const token = await result.json() as { access_token: string; refresh_token?: string; expires_in: number };
-  const saved = { access_token: token.access_token, refresh_token: token.refresh_token, expires_at: Date.now() + token.expires_in * 1000 };
-  const profile = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", { headers: { Authorization: `Bearer ${saved.access_token}` } });
+  const profile = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", { headers: { Authorization: `Bearer ${token.access_token}` } });
   if (!profile.ok) return new Response("Google autorizó el acceso, pero no pude identificar la cuenta.", { status: 400 });
   const { emailAddress } = await profile.json() as { emailAddress: string };
-  await env.STORE.put(`gmail-token:${emailAddress}`, JSON.stringify(saved));
+  const tokenKey = `gmail-token:${emailAddress}`;
+  const previousToken = await readGmailToken(tokenKey, env);
+  const saved: GmailToken = { access_token: token.access_token, refresh_token: token.refresh_token ?? previousToken?.refresh_token, expires_at: Date.now() + token.expires_in * 1000 };
+  await storeGmailToken(tokenKey, saved, env);
   const accounts = await env.STORE.get<GmailAccount[]>("gmail-accounts", "json") ?? [];
   if (!accounts.some(account => account.email === emailAddress)) accounts.push({ email: emailAddress });
   await env.STORE.put("gmail-accounts", JSON.stringify(accounts));
@@ -94,7 +158,7 @@ async function telegramWebhook(request: Request, env: Env): Promise<Response> {
   if (callback?.message && String(callback.message.chat.id) === env.TELEGRAM_OWNER_CHAT_ID) {
     let answer: BotReply;
     try { answer = await handleButton(callback.data ?? "", env); }
-    catch (error) { answer = { text: `⚠️ No pude completar la acción: ${error instanceof Error ? error.message : "error desconocido"}`, keyboard: await mainKeyboard(env) }; }
+    catch (error) { answer = { text: `⚠️ No pude completar la acción: ${escapeHtml(error instanceof Error ? error.message : "error desconocido")}`, keyboard: await mainKeyboard(env) }; }
     await telegramAnswerCallback(env, callback.id);
     await telegramRender(env, callback.message.chat.id, answer, callback.message.message_id);
     return new Response("ok");
@@ -103,7 +167,7 @@ async function telegramWebhook(request: Request, env: Env): Promise<Response> {
   if (!msg || String(msg.chat.id) !== env.TELEGRAM_OWNER_CHAT_ID) return new Response("ok");
   if (msg.voice) {
     let answer: BotReply;
-    try { answer = await handleVoice(msg.voice.file_id, env); } catch (error) { answer = { text: `⚠️ No pude transcribir la nota: ${error instanceof Error ? error.message : "error desconocido"}`, keyboard: await mainKeyboard(env) }; }
+    try { answer = await handleVoice(msg.voice.file_id, env); } catch (error) { answer = { text: `⚠️ No pude transcribir la nota: ${escapeHtml(error instanceof Error ? error.message : "error desconocido")}`, keyboard: await mainKeyboard(env) }; }
     await telegramRender(env, msg.chat.id, answer);
     return new Response("ok");
   }
@@ -112,14 +176,37 @@ async function telegramWebhook(request: Request, env: Env): Promise<Response> {
   if (activeFlow?.type === "pin-set" || activeFlow?.type === "pin-unlock") await telegramDelete(env, msg.chat.id, msg.message_id);
   let answer: BotReply;
   try { answer = await handleText(msg.text.trim(), env); }
-  catch (error) { answer = { text: `⚠️ No pude completar la acción: ${error instanceof Error ? error.message : "error desconocido"}`, keyboard: await mainKeyboard(env) }; }
+  catch (error) { answer = { text: `⚠️ No pude completar la acción: ${escapeHtml(error instanceof Error ? error.message : "error desconocido")}`, keyboard: await mainKeyboard(env) }; }
   await telegramRender(env, msg.chat.id, answer);
   return new Response("ok");
 }
 
 async function handleText(input: string, env: Env): Promise<BotReply> {
   const flow = await env.STORE.get<Flow>("flow", "json");
+  if (flow?.type === "pin-unlock") return continueFlow(input, flow, env);
   if (flow && !input.startsWith("/")) return continueFlow(input, flow, env);
+  const [command] = input.split(/\s+/, 1);
+  if (await pinRequired(`command:${command}`, env)) {
+    await env.STORE.put("flow", JSON.stringify({ type: "pin-unlock", pendingAction: `command:${input}` } satisfies Flow), { expirationTtl: 300 });
+    return { text: "🔐 Escribe tu PIN para continuar. Quedará desbloqueado durante 15 minutos.", keyboard: cancelKeyboard() };
+  }
+  if (command === "/inbox") {
+    const messages = await getMessageList("in:inbox", Number(input.slice(command.length).trim()) || 8, env);
+    return { text: formatMessageList(messages, "📬 Correos"), keyboard: messageKeyboard(messages) };
+  }
+  if (command === "/search") {
+    const query = input.slice(command.length).trim();
+    if (!query) return { text: "Uso: /search consulta", keyboard: await mainKeyboard(env) };
+    const messages = await getMessageList(query, 8, env);
+    return { text: formatMessageList(messages, "🔎 Resultados"), keyboard: messageKeyboard(messages) };
+  }
+  if (command === "/read") {
+    const id = input.slice(command.length).trim();
+    if (!id) return { text: "Uso: /read ID", keyboard: await mainKeyboard(env) };
+    return { text: escapeHtml(await readMessage(id, env)), keyboard: await readKeyboard(id, env) };
+  }
+  if (command === "/send") return prepareDirectSend(input.slice(command.length).trim(), env);
+  if (command === "/reply") return prepareDirectReply(input.slice(command.length).trim(), env);
   const textReply = await handleCommand(input, env);
   if (input === "/start" || input === "/help") return { text: "✨ <b>Bienvenido a Gmail en Telegram</b>\nElige una acción:", keyboard: await mainKeyboard(env) };
   return { text: escapeHtml(textReply), keyboard: await mainKeyboard(env) };
@@ -131,12 +218,27 @@ async function handleCommand(input: string, env: Env): Promise<string> {
   if (command === "/start" || command === "/help") return "✨ Menú principal";
   if (command === "/connect") return `Abre este enlace privado para conectar Gmail:\n${env.APP_URL}/auth/google?key=${env.AUTH_START_KEY}`;
   if (command === "/disconnect") { await disconnectActiveAccount(env); return "Acceso de la cuenta activa eliminado del bot."; }
-  if (command === "/inbox") return listMessages("in:inbox", Number(rest) || 8, env);
-  if (command === "/search") return rest ? listMessages(rest, 8, env) : "Uso: /search consulta";
-  if (command === "/read") return rest ? readMessage(rest, env) : "Uso: /read ID";
-  if (command === "/send") return sendNew(rest, env);
-  if (command === "/reply") return reply(rest, env);
   return "No conozco ese comando. Usa /help.";
+}
+
+async function prepareDirectSend(input: string, env: Env): Promise<BotReply> {
+  const [to, subject, ...bodyParts] = input.split("|").map(value => value.trim());
+  const body = bodyParts.join("|");
+  if (!to || !subject || !body) return { text: "Uso: /send destinatario | asunto | mensaje", keyboard: await mainKeyboard(env) };
+  if (body.length > 3000) return { text: "El mensaje supera el límite de 3000 caracteres para poder revisarlo completo aquí. Divídelo en varios correos.", keyboard: await mainKeyboard(env) };
+  await env.STORE.put("flow", JSON.stringify({ type: "confirm-compose", to, subject, body } satisfies Flow), { expirationTtl: 600 });
+  return { text: `📨 <b>Revisa antes de enviar</b>\n\n<b>Para:</b> ${escapeHtml(to)}\n<b>Asunto:</b> ${escapeHtml(subject)}\n\n${escapeHtml(body)}`, keyboard: confirmKeyboard() };
+}
+
+async function prepareDirectReply(input: string, env: Env): Promise<BotReply> {
+  const [id, ...bodyParts] = input.split("|").map(value => value.trim());
+  const body = bodyParts.join("|");
+  if (!id || !body) return { text: "Uso: /reply ID | mensaje", keyboard: await mainKeyboard(env) };
+  if (body.length > 3000) return { text: "La respuesta supera el límite de 3000 caracteres para poder revisarla completa aquí. Divídela en varios mensajes.", keyboard: await mainKeyboard(env) };
+  const original = await (await gmailFetch(`messages/${encodeURIComponent(id)}?format=metadata&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=Subject`, env)).json() as GmailMessage;
+  const to = header(original, "Reply-To") || header(original, "From");
+  await env.STORE.put("flow", JSON.stringify({ type: "confirm-reply", messageId: id, body } satisfies Flow), { expirationTtl: 600 });
+  return { text: `↩️ <b>Revisa la respuesta</b>\n\n<b>Para:</b> ${escapeHtml(to)}\n<b>Asunto:</b> ${escapeHtml(header(original, "Subject"))}\n\n${escapeHtml(body)}`, keyboard: confirmKeyboard() };
 }
 
 async function handleButton(data: string, env: Env): Promise<BotReply> {
@@ -229,6 +331,7 @@ async function continueFlow(input: string, flow: Flow, env: Env): Promise<BotRep
   if (flow.type === "pin-unlock") {
     if (await env.STORE.get("pin-hash") !== await hashPin(input)) return { text: "⚠️ PIN incorrecto. Inténtalo otra vez.", keyboard: cancelKeyboard() };
     await env.STORE.put("pin-valid-until", String(Date.now() + 15 * 60 * 1000)); await env.STORE.delete("flow");
+    if (flow.pendingAction?.startsWith("command:")) return handleText(flow.pendingAction.slice("command:".length), env);
     return handleButton(flow.pendingAction ?? "menu:home", env);
   }
   if (flow.type === "search") {
@@ -243,8 +346,16 @@ async function continueFlow(input: string, flow: Flow, env: Env): Promise<BotRep
   }
   if (flow.type === "compose-to") { await env.STORE.put("flow", JSON.stringify({ type: "compose-subject", to: input } satisfies Flow), { expirationTtl: 600 }); return { text: "📝 Ahora escribe el <b>asunto</b> del correo:", keyboard: cancelKeyboard() }; }
   if (flow.type === "compose-subject") { await env.STORE.put("flow", JSON.stringify({ type: "compose-body", to: flow.to, subject: input } satisfies Flow), { expirationTtl: 600 }); return { text: "💬 Escribe el <b>mensaje</b> que quieres enviar:", keyboard: cancelKeyboard() }; }
-  if (flow.type === "compose-body") { await env.STORE.put("flow", JSON.stringify({ type: "confirm-compose", to: flow.to, subject: flow.subject, body: input } satisfies Flow), { expirationTtl: 600 }); return { text: `📨 <b>Revisa antes de enviar</b>\n\n<b>Para:</b> ${escapeHtml(flow.to ?? "")}\n<b>Asunto:</b> ${escapeHtml(flow.subject ?? "")}\n\n${escapeHtml(input)}`, keyboard: confirmKeyboard() }; }
-  if (flow.type === "reply" && flow.messageId) { await env.STORE.put("flow", JSON.stringify({ type: "confirm-reply", messageId: flow.messageId, body: input } satisfies Flow), { expirationTtl: 600 }); return { text: `↩️ <b>Revisa la respuesta</b>\n\n${escapeHtml(input)}`, keyboard: confirmKeyboard() }; }
+  if (flow.type === "compose-body") {
+    if (input.length > 3000) return { text: "El mensaje supera el límite de 3000 caracteres para poder revisarlo completo aquí. Divídelo en varios correos.", keyboard: cancelKeyboard() };
+    await env.STORE.put("flow", JSON.stringify({ type: "confirm-compose", to: flow.to, subject: flow.subject, body: input } satisfies Flow), { expirationTtl: 600 });
+    return { text: `📨 <b>Revisa antes de enviar</b>\n\n<b>Para:</b> ${escapeHtml(flow.to ?? "")}\n<b>Asunto:</b> ${escapeHtml(flow.subject ?? "")}\n\n${escapeHtml(input)}`, keyboard: confirmKeyboard() };
+  }
+  if (flow.type === "reply" && flow.messageId) {
+    if (input.length > 3000) return { text: "La respuesta supera el límite de 3000 caracteres para poder revisarla completa aquí. Divídela en varios mensajes.", keyboard: cancelKeyboard() };
+    await env.STORE.put("flow", JSON.stringify({ type: "confirm-reply", messageId: flow.messageId, body: input } satisfies Flow), { expirationTtl: 600 });
+    return { text: `↩️ <b>Revisa la respuesta</b>\n\n${escapeHtml(input)}`, keyboard: confirmKeyboard() };
+  }
   await env.STORE.delete("flow"); return { text: "⚠️ La acción venció. Inténtalo de nuevo.", keyboard: await mainKeyboard(env) };
 }
 
@@ -256,7 +367,8 @@ async function hashPin(pin: string): Promise<string> {
 async function pinRequired(data: string, env: Env): Promise<boolean> {
   if (!await env.STORE.get("pin-hash")) return false;
   if (Number(await env.STORE.get("pin-valid-until") ?? 0) > Date.now()) return false;
-  return data.startsWith("mail:read:") || data.startsWith("mail:thread:") || data.startsWith("mail:attachment:") || data.startsWith("ai:") || data === "send:confirm" || data.startsWith("draft:open:") || data.startsWith("draft:send:") || data.startsWith("mail:trash-confirm:") || data === "pin:disable";
+  if (data.startsWith("command:")) return ["/inbox", "/search", "/read", "/send", "/reply"].includes(data.slice("command:".length).split(/\s+/, 1)[0]);
+  return data === "menu:inbox" || data === "menu:unread" || data === "menu:starred" || data === "menu:today" || data === "menu:sent" || data === "menu:trash" || data === "menu:spam" || data === "menu:drafts" || data === "menu:contacts" || data === "menu:history" || data === "menu:scheduled" || data.startsWith("filter:") || data.startsWith("mail:read:") || data.startsWith("mail:thread:") || data.startsWith("mail:attachment:") || data.startsWith("ai:") || data === "send:confirm" || data.startsWith("draft:open:") || data.startsWith("draft:send:") || data.startsWith("draft:delete:") || data.startsWith("mail:trash-confirm:") || data.startsWith("schedule:") || data === "pin:disable";
 }
 
 async function confirmSend(env: Env): Promise<BotReply> {
@@ -330,8 +442,8 @@ const messageKeyboard = (messages: GmailMessage[], page?: { key: string; hasPrev
 
 async function activeAccount(env: Env): Promise<{ email: string; key: string; token: GmailToken } | undefined> {
   const email = await env.STORE.get("active-gmail");
-  if (email && email !== "legacy") { const token = await env.STORE.get<GmailToken>(`gmail-token:${email}`, "json"); if (token) return { email, key: `gmail-token:${email}`, token }; }
-  const legacy = await env.STORE.get<GmailToken>("gmail-token", "json");
+  if (email && email !== "legacy") { const key = `gmail-token:${email}`; const token = await readGmailToken(key, env); if (token) return { email, key, token }; }
+  const legacy = await readGmailToken("gmail-token", env);
   return legacy ? { email: "Cuenta original", key: "gmail-token", token: legacy } : undefined;
 }
 
@@ -365,7 +477,7 @@ async function gmailFetch(path: string, env: Env, init: RequestInit = {}): Promi
     if (!refreshed.ok) throw new Error("Google pidió volver a autorizar la cuenta");
     const data = await refreshed.json() as { access_token: string; expires_in: number };
     token = { ...token, access_token: data.access_token, expires_at: Date.now() + data.expires_in * 1000 };
-    await env.STORE.put(active.key, JSON.stringify(token));
+    await storeGmailToken(active.key, token, env);
   }
   const headers = new Headers(init.headers); headers.set("Authorization", `Bearer ${token.access_token}`);
   const response = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/${path}`, { ...init, headers });
@@ -465,6 +577,7 @@ async function cancelScheduledMail(id: string, env: Env): Promise<BotReply> {
 }
 
 async function createDraft(raw: string, env: Env, threadId?: string): Promise<void> {
+  validateOutgoingRaw(raw);
   await gmailFetch("drafts", env, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: { raw: b64url(raw), ...(threadId ? { threadId } : {}) } }) });
 }
 
@@ -781,11 +894,6 @@ async function sendAttachment(index: number, env: Env): Promise<void> {
   if (!response.ok) throw new Error("Telegram no pudo enviar el archivo");
 }
 
-async function listMessages(query: string, count: number, env: Env): Promise<string> {
-  const messages = await getMessageList(query, count, env);
-  return formatMessageList(messages, "📬 Correos");
-}
-
 async function getMessageList(query: string, count: number, env: Env): Promise<GmailMessage[]> {
   return (await getMessagePage(query, count, env)).messages;
 }
@@ -911,16 +1019,25 @@ async function readMessage(id: string, env: Env): Promise<string> {
 }
 
 async function sendRaw(raw: string, env: Env, threadId?: string): Promise<void> {
+  validateOutgoingRaw(raw);
   await gmailFetch("messages/send", env, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ raw: b64url(raw), ...(threadId ? { threadId } : {}) }) });
   await audit(threadId ? "Respuesta enviada" : "Correo enviado", env);
 }
 
-async function sendNew(input: string, env: Env): Promise<string> {
-  const [to, subject, ...bodyParts] = input.split("|").map(s => s.trim()); const body = bodyParts.join("|");
-  if (!to || !subject || !body) return "Uso: /send destinatario | asunto | mensaje";
-  await sendRaw(`To: ${to}\r\nSubject: ${subject}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n${body}`, env);
-  await rememberContacts(to, env);
-  return "Correo enviado.";
+function validateOutgoingRaw(raw: string): void {
+  const separator = raw.indexOf("\r\n\r\n");
+  if (separator < 0) throw new Error("El formato del correo no es válido.");
+  const allowed = new Set(["to", "subject", "mime-version", "content-type", "in-reply-to", "references"]);
+  const seen = new Set<string>();
+  for (const line of raw.slice(0, separator).split("\r\n")) {
+    const colon = line.indexOf(":");
+    if (colon < 1) throw new Error("El formato del correo no es válido.");
+    const name = line.slice(0, colon).toLowerCase();
+    const value = line.slice(colon + 1);
+    if (!allowed.has(name) || seen.has(name) || /[\u0000-\u001f\u007f]/.test(value)) throw new Error("El correo contiene un encabezado no permitido.");
+    seen.add(name);
+  }
+  if (!seen.has("to") || !seen.has("subject")) throw new Error("El correo necesita destinatario y asunto.");
 }
 
 async function reply(input: string, env: Env): Promise<string> {

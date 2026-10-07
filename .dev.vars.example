@@ -6,3 +6,5 @@ TELEGRAM_OWNER_CHAT_ID=123456789
 GOOGLE_CLIENT_ID=xxxxx.apps.googleusercontent.com
 GOOGLE_CLIENT_SECRET=GOCSPX-xxxxx
 AUTH_START_KEY=otra-cadena-larga-aleatoria
+TOKEN_ENCRYPTION_KEY=64-caracteres-hexadecimales-generados-localmente
+OPENAI_API_KEY=
