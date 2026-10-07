@@ -61,4 +61,4 @@ En Telegram usa `/connect`, abre el enlace privado y autoriza Gmail.
 /disconnect
 ```
 
-El bot solo atiende el `TELEGRAM_OWNER_CHAT_ID` configurado y valida el secreto del webhook. Los tokens de Gmail quedan guardados cifrados en la infraestructura de Cloudflare KV, nunca en el repositorio.
+El bot solo atiende el `TELEGRAM_OWNER_CHAT_ID` configurado y valida el secreto del webhook. Los tokens de Gmail se guardan en Cloudflare KV y nunca se incluyen en el repositorio. Consulta la [política de privacidad](https://telegram-gmail-bot.jersonestrada50.workers.dev/privacy) para conocer el tratamiento de datos.
