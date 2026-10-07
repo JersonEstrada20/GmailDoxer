@@ -7,6 +7,6 @@
     "crons": ["0 * * * *"]
   },
   "kv_namespaces": [
-    { "binding": "STORE" }
+    { "binding": "STORE", "id": "cf5aae4736d64e4ebd485eb647f1b5ae" }
   ]
 }
