@@ -1,0 +1,8 @@
+# Copia este archivo como .dev.vars para pruebas locales. Nunca publiques este archivo.
+APP_URL=http://localhost:8787
+TELEGRAM_BOT_TOKEN=123456:ABCDEF
+TELEGRAM_WEBHOOK_SECRET=una-cadena-larga-aleatoria
+TELEGRAM_OWNER_CHAT_ID=123456789
+GOOGLE_CLIENT_ID=xxxxx.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-xxxxx
+AUTH_START_KEY=otra-cadena-larga-aleatoria

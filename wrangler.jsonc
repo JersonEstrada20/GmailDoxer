@@ -1,0 +1,12 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "telegram-gmail-bot",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-13",
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+  "kv_namespaces": [
+    { "binding": "STORE" }
+  ]
+}
